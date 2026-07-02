@@ -148,6 +148,7 @@ TESTLIST_BEGIN (script)
     TESTENTRY (memory_can_be_protected)
     TESTENTRY (memory_protection_can_be_queried)
     TESTENTRY (code_can_be_patched)
+    TESTENTRY (code_patch_race_does_not_wedge_allocator)
     TESTENTRY (utf8_string_can_be_allocated)
     TESTENTRY (utf16_string_can_be_allocated)
 #ifdef HAVE_WINDOWS
@@ -9607,6 +9608,123 @@ TESTCASE (code_can_be_patched)
   g_assert_cmphex (code[7], ==, 0x90);
 
   gum_free_pages (code);
+}
+
+typedef struct _GumPatchRaceChurn GumPatchRaceChurn;
+
+struct _GumPatchRaceChurn
+{
+  volatile gint stop;
+};
+
+static volatile gint gum_patch_race_done;
+
+static gpointer
+gum_patch_race_churn_worker (gpointer data)
+{
+  GumPatchRaceChurn * churn = data;
+  guint round = 0;
+
+  while (g_atomic_int_get (&churn->stop) == 0)
+  {
+    GHashTable * headers;
+    GVariant * body;
+    guint i;
+
+    headers = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+    for (i = 0; i != 8; i++)
+    {
+      g_hash_table_insert (headers, g_strdup_printf ("header-%u-%u", round, i),
+          g_strdup_printf ("value-%u-%u", round, i));
+    }
+    g_hash_table_remove_all (headers);
+    g_hash_table_unref (headers);
+
+    body = g_variant_new ("(sis)", "reproducer", (gint) round, "payload");
+    g_variant_ref_sink (body);
+    g_variant_unref (body);
+
+    round++;
+  }
+
+  return NULL;
+}
+
+static gpointer
+gum_patch_race_watchdog (gpointer data)
+{
+  guint timeout_s = GPOINTER_TO_UINT (data);
+  guint i;
+
+  for (i = 0; i != timeout_s * 10; i++)
+  {
+    if (g_atomic_int_get (&gum_patch_race_done) != 0)
+      return NULL;
+    g_usleep (G_USEC_PER_SEC / 10);
+  }
+
+  {
+    static const gchar msg[] =
+        "\n[gum-patch-race] WEDGE DETECTED — gum mspace deadlock "
+        "reproduced\n";
+
+    write (STDERR_FILENO, msg, sizeof (msg) - 1);
+  }
+  abort ();
+
+  return NULL;
+}
+
+TESTCASE (code_patch_race_does_not_wedge_allocator)
+{
+  const gchar * env;
+  guint n_threads, n_iters, timeout_s, i;
+  GumPatchRaceChurn churn = { 0 };
+  GThread ** workers;
+  GThread * watchdog;
+
+  if (g_getenv ("GUM_RACE") == NULL)
+  {
+    g_print ("<skipping, set GUM_RACE=1 to run allocator race repro> ");
+    return;
+  }
+
+  n_threads = (env = g_getenv ("GUM_RACE_THREADS")) != NULL ? atoi (env) : 8;
+  n_iters = (env = g_getenv ("GUM_RACE_ITERS")) != NULL ? atoi (env) : 20000;
+  timeout_s = (env = g_getenv ("GUM_RACE_TIMEOUT")) != NULL ? atoi (env) : 60;
+
+  g_atomic_int_set (&gum_patch_race_done, 0);
+
+  workers = g_newa (GThread *, n_threads);
+  for (i = 0; i != n_threads; i++)
+  {
+    workers[i] = g_thread_new ("gum-patch-race-churn",
+        gum_patch_race_churn_worker, &churn);
+  }
+  watchdog = g_thread_new ("gum-patch-race-watchdog", gum_patch_race_watchdog,
+      GUINT_TO_POINTER (timeout_s));
+
+  COMPILE_AND_LOAD_SCRIPT (
+      "const page = Memory.alloc(Process.pageSize);"
+      "const cb = new NativeCallback(x => { const a = [x]; return a[0] + 1; },"
+          "'int', ['int']);"
+      "const f = new NativeFunction(cb, 'int', ['int']);"
+      "const N = %u;"
+      "for (let i = 0; i !== N; i++) {"
+      "  Memory.patchCode(page, 1, code => { code.writeU8(0xc3); });"
+      "  f(i);"
+      "}"
+      "send('done');",
+      n_iters);
+
+  EXPECT_SEND_MESSAGE_WITH ("\"done\"");
+
+  g_atomic_int_set (&gum_patch_race_done, 1);
+  g_thread_join (watchdog);
+
+  g_atomic_int_set (&churn.stop, 1);
+  for (i = 0; i != n_threads; i++)
+    g_thread_join (workers[i]);
 }
 
 TESTCASE (utf8_string_can_be_allocated)
