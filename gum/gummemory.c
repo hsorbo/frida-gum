@@ -143,6 +143,9 @@ struct _GumPointerScanTask
 
 static void gum_apply_patch_code (gpointer mem, gpointer target_page,
     guint n_pages, gpointer user_data);
+static gboolean gum_memory_patch_code_pages_via_remap (
+    GPtrArray * sorted_addresses, gboolean coalesce, gsize page_size,
+    GumMemoryPatchPagesApplyFunc apply, gpointer apply_data);
 static gboolean gum_maybe_suspend_thread (const GumThreadDetails * details,
     gpointer user_data);
 
@@ -436,146 +439,8 @@ gum_memory_patch_code_pages (GPtrArray * sorted_addresses,
 
   if (gum_memory_can_remap_writable ())
   {
-    GArray * plumps;
-    GumPageLump * last;
-
-#ifdef HAVE_DARWIN
-    if (gum_darwin_is_debugger_mapping_enforced ())
-    {
-      GumPagePlanBuilder plan;
-      gboolean success;
-
-      _gum_page_plan_builder_init (&plan);
-
-      for (i = 0; i != sorted_addresses->len; i++)
-      {
-        gpointer target_page = g_ptr_array_index (sorted_addresses, i);
-
-        _gum_page_plan_builder_add_page (&plan, target_page);
-      }
-
-      success = _gum_page_plan_builder_post (&plan);
-
-      _gum_page_plan_builder_free (&plan);
-
-      if (!success)
-        return FALSE;
-    }
-#endif
-
-    plumps = g_array_new (FALSE, FALSE, sizeof (GumPageLump));
-    last = NULL;
-
-    for (i = 0; i != sorted_addresses->len; i++)
-    {
-      guint8 * target_page = g_ptr_array_index (sorted_addresses, i);
-
-      last = (plumps->len != 0)
-          ? &g_array_index (plumps, GumPageLump, plumps->len - 1)
-          : NULL;
-
-      if (last == NULL || last->end != target_page)
-      {
-        GumPageLump lump;
-
-        if (last != NULL)
-        {
-          gpointer writable;
-
-          writable = gum_memory_try_remap_writable_pages (last->start,
-              last->n_pages);
-          if (writable == NULL)
-          {
-            result = FALSE;
-            goto cleanup;
-          }
-
-          last->writable_start = writable;
-        }
-
-        lump.start = target_page;
-        lump.end = target_page;
-        lump.writable_start = NULL;
-        lump.n_pages = 0;
-
-        g_array_append_val (plumps, lump);
-      }
-
-      last = &g_array_index (plumps, GumPageLump, plumps->len - 1);
-      last->end = target_page + page_size;
-      last->n_pages++;
-    }
-
-    if (plumps->len == 0)
-      goto cleanup;
-
-    last->writable_start =
-        gum_memory_try_remap_writable_pages (last->start, last->n_pages);
-    if (last->writable_start == NULL)
-    {
-      result = FALSE;
-      goto cleanup;
-    }
-
-    if (coalesce)
-    {
-      for (i = 0; i != plumps->len; i++)
-      {
-        const GumPageLump * plump = &g_array_index (plumps, GumPageLump, i);
-
-        apply (plump->writable_start, plump->start, plump->n_pages, apply_data);
-      }
-    }
-    else
-    {
-      guint plump_index = 0;
-
-      for (i = 0; i != sorted_addresses->len; i++)
-      {
-        guint8 * target_page;
-        const GumPageLump * plump;
-        gsize offset;
-
-        target_page = g_ptr_array_index (sorted_addresses, i);
-
-        plump = &g_array_index (plumps, GumPageLump, plump_index);
-
-        if (target_page >= (guint8 *) plump->end)
-        {
-          plump_index++;
-          g_assert (plump_index != plumps->len);
-          plump = &g_array_index (plumps, GumPageLump, plump_index);
-        }
-
-        g_assert (target_page >= (guint8 *) plump->start);
-        g_assert (target_page < (guint8 *) plump->end);
-        offset = target_page - (guint8 *) plump->start;
-
-        apply ((guint8 *) plump->writable_start + offset, target_page, 1,
-            apply_data);
-      }
-    }
-
-    for (i = 0; i != sorted_addresses->len; i++)
-    {
-      gpointer target_page = g_ptr_array_index (sorted_addresses, i);
-
-      gum_clear_cache (target_page, page_size);
-    }
-
-cleanup:
-    for (i = 0; i != plumps->len; i++)
-    {
-      const GumPageLump * plump = &g_array_index (plumps, GumPageLump, i);
-
-      if (plump->writable_start != NULL)
-      {
-        gum_memory_dispose_writable_pages (plump->writable_start,
-            plump->n_pages);
-      }
-    }
-
-    g_array_unref (plumps);
+    return gum_memory_patch_code_pages_via_remap (sorted_addresses, coalesce,
+        page_size, apply, apply_data);
   }
   else if (rwx_supported || !gum_code_segment_is_supported ())
   {
@@ -783,6 +648,159 @@ resume_threads:
 
     gum_code_segment_free (segment);
   }
+
+  return result;
+}
+
+static gboolean
+gum_memory_patch_code_pages_via_remap (GPtrArray * sorted_addresses,
+                                       gboolean coalesce,
+                                       gsize page_size,
+                                       GumMemoryPatchPagesApplyFunc apply,
+                                       gpointer apply_data)
+{
+  gboolean result = TRUE;
+  guint i;
+  GArray * plumps;
+  GumPageLump * last;
+
+#ifdef HAVE_DARWIN
+  if (gum_darwin_is_debugger_mapping_enforced ())
+  {
+    GumPagePlanBuilder plan;
+    gboolean success;
+
+    _gum_page_plan_builder_init (&plan);
+
+    for (i = 0; i != sorted_addresses->len; i++)
+    {
+      gpointer target_page = g_ptr_array_index (sorted_addresses, i);
+
+      _gum_page_plan_builder_add_page (&plan, target_page);
+    }
+
+    success = _gum_page_plan_builder_post (&plan);
+
+    _gum_page_plan_builder_free (&plan);
+
+    if (!success)
+      return FALSE;
+  }
+#endif
+
+  plumps = g_array_new (FALSE, FALSE, sizeof (GumPageLump));
+  last = NULL;
+
+  for (i = 0; i != sorted_addresses->len; i++)
+  {
+    guint8 * target_page = g_ptr_array_index (sorted_addresses, i);
+
+    last = (plumps->len != 0)
+        ? &g_array_index (plumps, GumPageLump, plumps->len - 1)
+        : NULL;
+
+    if (last == NULL || last->end != target_page)
+    {
+      GumPageLump lump;
+
+      if (last != NULL)
+      {
+        gpointer writable;
+
+        writable = gum_memory_try_remap_writable_pages (last->start,
+            last->n_pages);
+        if (writable == NULL)
+        {
+          result = FALSE;
+          goto cleanup;
+        }
+
+        last->writable_start = writable;
+      }
+
+      lump.start = target_page;
+      lump.end = target_page;
+      lump.writable_start = NULL;
+      lump.n_pages = 0;
+
+      g_array_append_val (plumps, lump);
+    }
+
+    last = &g_array_index (plumps, GumPageLump, plumps->len - 1);
+    last->end = target_page + page_size;
+    last->n_pages++;
+  }
+
+  if (plumps->len == 0)
+    goto cleanup;
+
+  last->writable_start =
+      gum_memory_try_remap_writable_pages (last->start, last->n_pages);
+  if (last->writable_start == NULL)
+  {
+    result = FALSE;
+    goto cleanup;
+  }
+
+  if (coalesce)
+  {
+    for (i = 0; i != plumps->len; i++)
+    {
+      const GumPageLump * plump = &g_array_index (plumps, GumPageLump, i);
+
+      apply (plump->writable_start, plump->start, plump->n_pages, apply_data);
+    }
+  }
+  else
+  {
+    guint plump_index = 0;
+
+    for (i = 0; i != sorted_addresses->len; i++)
+    {
+      guint8 * target_page;
+      const GumPageLump * plump;
+      gsize offset;
+
+      target_page = g_ptr_array_index (sorted_addresses, i);
+
+      plump = &g_array_index (plumps, GumPageLump, plump_index);
+
+      if (target_page >= (guint8 *) plump->end)
+      {
+        plump_index++;
+        g_assert (plump_index != plumps->len);
+        plump = &g_array_index (plumps, GumPageLump, plump_index);
+      }
+
+      g_assert (target_page >= (guint8 *) plump->start);
+      g_assert (target_page < (guint8 *) plump->end);
+      offset = target_page - (guint8 *) plump->start;
+
+      apply ((guint8 *) plump->writable_start + offset, target_page, 1,
+          apply_data);
+    }
+  }
+
+  for (i = 0; i != sorted_addresses->len; i++)
+  {
+    gpointer target_page = g_ptr_array_index (sorted_addresses, i);
+
+    gum_clear_cache (target_page, page_size);
+  }
+
+cleanup:
+  for (i = 0; i != plumps->len; i++)
+  {
+    const GumPageLump * plump = &g_array_index (plumps, GumPageLump, i);
+
+    if (plump->writable_start != NULL)
+    {
+      gum_memory_dispose_writable_pages (plump->writable_start,
+          plump->n_pages);
+    }
+  }
+
+  g_array_unref (plumps);
 
   return result;
 }
