@@ -150,6 +150,9 @@ static gboolean gum_memory_patch_code_pages_via_mprotect (
     GPtrArray * sorted_addresses, gboolean coalesce, gsize page_size,
     gboolean rwx_supported, GumMemoryPatchPagesApplyFunc apply,
     gpointer apply_data);
+static gboolean gum_memory_patch_code_pages_via_code_segment (
+    GPtrArray * sorted_addresses, gboolean coalesce, gsize page_size,
+    GumMemoryPatchPagesApplyFunc apply, gpointer apply_data);
 static gboolean gum_maybe_suspend_thread (const GumThreadDetails * details,
     gpointer user_data);
 
@@ -431,11 +434,7 @@ gum_memory_patch_code_pages (GPtrArray * sorted_addresses,
                              GumMemoryPatchPagesApplyFunc apply,
                              gpointer apply_data)
 {
-  gboolean result = TRUE;
   gsize page_size;
-  guint i;
-  guint8 * apply_start, * apply_target_start;
-  guint apply_num_pages;
   gboolean rwx_supported;
 
   rwx_supported = gum_query_is_rwx_supported ();
@@ -453,82 +452,9 @@ gum_memory_patch_code_pages (GPtrArray * sorted_addresses,
   }
   else
   {
-    GumCodeSegment * segment;
-    guint8 * source_page, * current_page;
-    gsize source_offset;
-
-    segment = gum_code_segment_new (sorted_addresses->len * page_size, NULL);
-
-    source_page = gum_code_segment_get_address (segment);
-
-    current_page = source_page;
-    for (i = 0; i != sorted_addresses->len; i++)
-    {
-      guint8 * target_page = g_ptr_array_index (sorted_addresses, i);
-
-      memcpy (current_page, target_page, page_size);
-
-      current_page += page_size;
-    }
-
-    apply_start = NULL;
-    apply_num_pages = 0;
-    for (i = 0; i != sorted_addresses->len; i++)
-    {
-      guint8 * target_page = g_ptr_array_index (sorted_addresses, i);
-
-      if (coalesce)
-      {
-        if (apply_start != NULL)
-        {
-          if (target_page == apply_target_start + (page_size * apply_num_pages))
-          {
-            apply_num_pages++;
-          }
-          else
-          {
-            apply (apply_start, apply_target_start, apply_num_pages,
-                apply_data);
-            apply_start = NULL;
-          }
-        }
-
-        if (apply_start == NULL)
-        {
-          apply_start = source_page;
-          apply_target_start = target_page;
-          apply_num_pages = 1;
-        }
-      }
-      else
-      {
-        apply (source_page, target_page, 1, apply_data);
-      }
-
-      source_page += page_size;
-    }
-
-    if (apply_num_pages != 0)
-      apply (apply_start, apply_target_start, apply_num_pages, apply_data);
-
-    gum_code_segment_realize (segment);
-
-    source_offset = 0;
-    for (i = 0; i != sorted_addresses->len; i++)
-    {
-      gpointer target_page = g_ptr_array_index (sorted_addresses, i);
-
-      gum_code_segment_map (segment, source_offset, page_size, target_page);
-
-      gum_clear_cache (target_page, page_size);
-
-      source_offset += page_size;
-    }
-
-    gum_code_segment_free (segment);
+    return gum_memory_patch_code_pages_via_code_segment (sorted_addresses,
+        coalesce, page_size, apply, apply_data);
   }
-
-  return result;
 }
 
 static gboolean
@@ -825,6 +751,94 @@ resume_threads:
   }
 
   return result;
+}
+
+static gboolean
+gum_memory_patch_code_pages_via_code_segment (
+    GPtrArray * sorted_addresses,
+    gboolean coalesce,
+    gsize page_size,
+    GumMemoryPatchPagesApplyFunc apply,
+    gpointer apply_data)
+{
+  guint i;
+  guint8 * apply_start, * apply_target_start;
+  guint apply_num_pages;
+  GumCodeSegment * segment;
+  guint8 * source_page, * current_page;
+  gsize source_offset;
+
+  segment = gum_code_segment_new (sorted_addresses->len * page_size, NULL);
+
+  source_page = gum_code_segment_get_address (segment);
+
+  current_page = source_page;
+  for (i = 0; i != sorted_addresses->len; i++)
+  {
+    guint8 * target_page = g_ptr_array_index (sorted_addresses, i);
+
+    memcpy (current_page, target_page, page_size);
+
+    current_page += page_size;
+  }
+
+  apply_start = NULL;
+  apply_num_pages = 0;
+  for (i = 0; i != sorted_addresses->len; i++)
+  {
+    guint8 * target_page = g_ptr_array_index (sorted_addresses, i);
+
+    if (coalesce)
+    {
+      if (apply_start != NULL)
+      {
+        if (target_page == apply_target_start + (page_size * apply_num_pages))
+        {
+          apply_num_pages++;
+        }
+        else
+        {
+          apply (apply_start, apply_target_start, apply_num_pages,
+              apply_data);
+          apply_start = NULL;
+        }
+      }
+
+      if (apply_start == NULL)
+      {
+        apply_start = source_page;
+        apply_target_start = target_page;
+        apply_num_pages = 1;
+      }
+    }
+    else
+    {
+      apply (source_page, target_page, 1, apply_data);
+    }
+
+    source_page += page_size;
+  }
+
+  if (apply_num_pages != 0)
+    apply (apply_start, apply_target_start, apply_num_pages, apply_data);
+
+  gum_code_segment_realize (segment);
+
+  source_offset = 0;
+  for (i = 0; i != sorted_addresses->len; i++)
+  {
+    gpointer target_page = g_ptr_array_index (sorted_addresses, i);
+
+    gum_code_segment_map (segment, source_offset, page_size, target_page);
+
+    gum_clear_cache (target_page, page_size);
+
+    source_offset += page_size;
+  }
+
+  gum_code_segment_free (segment);
+
+  return TRUE;
 }
 
 static gboolean
