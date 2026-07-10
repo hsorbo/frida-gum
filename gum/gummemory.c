@@ -813,11 +813,15 @@ gum_memory_patch_code_pages_via_mprotect (GPtrArray * sorted_addresses,
         break;
       }
 
-      gum_clear_cache (target_page, page_size);
-
       source_page += page_size;
       pristine_page += page_size;
     }
+  }
+
+  if (result)
+  {
+    for (i = 0; i != sorted_addresses->len; i++)
+      gum_clear_cache (g_ptr_array_index (sorted_addresses, i), page_size);
   }
 
   num_suspended = suspend_op.suspended_threads.length;
